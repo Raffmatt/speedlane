@@ -1,0 +1,12 @@
+# GitLab Pages serves whatever the `pages` job leaves in public/.
+# The game is a single self-contained HTML file, so there is nothing to build.
+pages:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Publishing public/ as-is"
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

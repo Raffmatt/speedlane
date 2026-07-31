@@ -1,0 +1,16 @@
+# Never commit the research material — it contains recordings and transcripts
+# of named people. Keep this repo to the game only.
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.m4a
+*.mp3
+*.srt
+*_transcript.txt
+Audio/
+Video/
+# Timestamped working copies of the game — one 18MB blob per save is not history
+*.backup-*.html
+.DS_Store
+node_modules/
