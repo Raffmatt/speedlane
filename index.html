@@ -4891,20 +4891,73 @@ const WORLD = { xMin: -60, xMax: 60, zMin: -45, zMax: 45 };
 const colliders = [];
 function box(minX, maxX, minZ, maxZ) { colliders.push({ minX, maxX, minZ, maxZ }); }
 
+// ---- Ground surface textures, drawn on a canvas at load (no image files).
+// Each canvas is a near-white grayscale detail map that multiplies the plane's
+// own color, so the muted palette stays as-is and only gains grain:
+//   asphalt  — fine aggregate speckle plus a few faint patch repairs
+//   concrete — softer speckle, slab joints along the tile edges, oil stains
+// Everything is drawn wrapped, so the tile repeats without visible seams.
+const SURFACE_TILE = { asphalt: 8, concrete: 4 }; // world units per tile
+const surfaceCanvas = {};
+function surfaceDetail(kind) {
+  if (surfaceCanvas[kind]) return surfaceCanvas[kind];
+  const N = 256;
+  const cnv = document.createElement('canvas');
+  cnv.width = cnv.height = N;
+  const g = cnv.getContext('2d');
+  let seed = kind === 'asphalt' ? 1337 : 4242; // fixed seed: same look every load
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  const wrapped = (x, y, draw) => {          // draw at x,y and its wrap-around copies
+    for (const dx of [-N, 0, N]) for (const dy of [-N, 0, N]) draw(x + dx, y + dy);
+  };
+  const blob = (x, y, r, color) => wrapped(x, y, (px, py) => {
+    const grd = g.createRadialGradient(px, py, 0, px, py, r);
+    grd.addColorStop(0, color); grd.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grd; g.fillRect(px - r, py - r, r * 2, r * 2);
+  });
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, N, N);
+  if (kind === 'asphalt') {
+    for (let i = 0; i < 5; i++) blob(rnd() * N, rnd() * N, 30 + rnd() * 50, 'rgba(0,0,0,0.07)');
+    for (let i = 0; i < 2600; i++) {
+      const v = rnd() < 0.7 ? 150 + rnd() * 70 : 255;   // mostly dark grit, some bright chips
+      g.fillStyle = `rgba(${v},${v},${v},${0.25 + rnd() * 0.35})`;
+      g.fillRect(rnd() * N, rnd() * N, 1 + rnd() * 1.5, 1 + rnd() * 1.5);
+    }
+  } else {
+    for (let i = 0; i < 3; i++) blob(rnd() * N, rnd() * N, 20 + rnd() * 25, 'rgba(40,30,20,0.10)');
+    for (let i = 0; i < 1400; i++) {
+      const v = 175 + rnd() * 60;
+      g.fillStyle = `rgba(${v},${v},${v},${0.15 + rnd() * 0.25})`;
+      g.fillRect(rnd() * N, rnd() * N, 1, 1);
+    }
+    g.fillStyle = 'rgba(0,0,0,0.16)';         // slab joints on two edges = a grid once tiled
+    g.fillRect(0, 0, N, 2); g.fillRect(0, 0, 2, N);
+  }
+  return (surfaceCanvas[kind] = cnv);
+}
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+function surfaceMat(color, kind, w, h) {
+  const tex = new THREE.CanvasTexture(surfaceDetail(kind));
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(w / SURFACE_TILE[kind], h / SURFACE_TILE[kind]);
+  tex.anisotropy = maxAniso;                // keeps the grain crisp at low camera angles
+  return toon(color, { map: tex });
+}
+
 // ---- Ground: asphalt everywhere
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(WORLD.xMax - WORLD.xMin, WORLD.zMax - WORLD.zMin),
-  toon(0x808488)
+  surfaceMat(0x808488, 'asphalt', WORLD.xMax - WORLD.xMin, WORLD.zMax - WORLD.zMin)
 );
 ground.rotation.x = -Math.PI / 2;
 ground.position.set(0, 0, 0);
 ground.receiveShadow = true;
 scene.add(ground);
 
-function flatPlane(x0, x1, z0, z1, color, y = 0.02) {
+function flatPlane(x0, x1, z0, z1, color, y = 0.02, surface = null) {
   const p = new THREE.Mesh(
     new THREE.PlaneGeometry(x1 - x0, z1 - z0),
-    toon(color)
+    surface ? surfaceMat(color, surface, x1 - x0, z1 - z0) : toon(color)
   );
   p.rotation.x = -Math.PI / 2;
   p.position.set((x0 + x1) / 2, y, (z0 + z1) / 2);
@@ -4922,11 +4975,11 @@ function paintLine(x0, x1, z0, z1, y = 0.04, color = 0xf0f0f0) {
 }
 
 // ---- Road Street (west edge, runs north-south)
-flatPlane(-60, -52, -45, 45, 0x6f7377);
+flatPlane(-60, -52, -45, 45, 0x6f7377, 0.02, 'asphalt');
 for (let z = -42; z < 45; z += 6) paintLine(-56.3, -55.7, z, z + 2.5, 0.03, 0xe6e2d8); // dashed centre line
 
 // ---- Road Entry (internal road, painted lines only)
-flatPlane(-52, 58, 8, 16, 0x7a7e83);
+flatPlane(-52, 58, 8, 16, 0x7a7e83, 0.02, 'asphalt');
 paintLine(-52, 58, 7.8, 8.2);   // north edge line
 paintLine(-52, 58, 15.8, 16.2); // south edge line
 
@@ -5327,7 +5380,7 @@ addCar(-27, -6.5, -0.2);
 // =========================================================
 wallZ(-20, -6, 6, OFC.wallH, wallMat); // tunnel north wall
 wallZ(-15, -6, 6, OFC.wallH, wallMat); // tunnel south wall
-flatPlane(-6, 6, -20, -15, 0x84898e, 0.03);
+flatPlane(-6, 6, -20, -15, 0x84898e, 0.03, 'concrete');
 paintLine(-6, 6, -19.6, -19.3, 0.045, 0xd6a851);
 paintLine(-6, 6, -15.7, -15.4, 0.045, 0xd6a851);
 makeLabel('Corridor', 4).position.set(0, 3.6, -17.5);
@@ -5336,7 +5389,7 @@ makeLabel('Corridor', 4).position.set(0, 3.6, -17.5);
 // Workshop — same size as the office
 // =========================================================
 const WS = { x0: 6, x1: 36, z0: -33, z1: -5 }; // 20% shorter: clear driving lane to the car wash
-flatPlane(WS.x0, WS.x1, WS.z0, WS.z1, 0x8b9095, 0.03);
+flatPlane(WS.x0, WS.x1, WS.z0, WS.z1, 0x8b9095, 0.03, 'concrete');
 wallZ(WS.z0, WS.x0, WS.x1, OFC.wallH, wallMat);       // north
 wallX(WS.x1, WS.z0, WS.z1, OFC.wallH, wallMat);       // east
 wallX(WS.x0, WS.z0, -20, OFC.wallH, wallMat);         // west, north of tunnel
@@ -5347,7 +5400,7 @@ makeLabel('Workshop', 7).position.set(25, 5, -19);
 // ---- Tunnel: the only way cars reach the workshop from outside (GDD)
 wallX(30, WS.z1, 7, OFC.wallH, wallMat);
 wallX(36, WS.z1, 7, OFC.wallH, wallMat);
-flatPlane(30, 36, -5, 7, 0x84898e, 0.03);
+flatPlane(30, 36, -5, 7, 0x84898e, 0.03, 'concrete');
 paintLine(30.4, 30.7, -4.5, 6.6, 0.045, 0xd6a851);
 paintLine(35.3, 35.6, -4.5, 6.6, 0.045, 0xd6a851);
 // The name and the live bay count share one chip (tunnelSign, set below)
@@ -5460,7 +5513,7 @@ const RECEPTION_DOOR = { x: 11.5, z: 3 };
 // =========================================================
 {
   const CW = { x0: 48, x1: 58, z0: -28, z1: -16 };
-  flatPlane(CW.x0, CW.x1, CW.z0, CW.z1, 0x9aabb8, 0.03);
+  flatPlane(CW.x0, CW.x1, CW.z0, CW.z1, 0x9aabb8, 0.03, 'concrete');
   // Glazed on all three closed sides, open to the west so cars can drive in
   glassZ(CW.z0, CW.x0, CW.x1, 3.5);
   glassX(CW.x1, CW.z0, CW.z1, 3.5);
