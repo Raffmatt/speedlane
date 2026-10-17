@@ -4573,6 +4573,8 @@ let currentWeather = 'sunny';
 const WEATHER_EMOJI = { sunny: '☀️', rainy: '🌧️', hot: '🔥' };
 function setWeather(mode) {
   if (!WEATHER[mode]) return;
+  // Sun after rain: the rainbow clock starts now (see updateRainFx)
+  if (currentWeather === 'rainy' && mode !== 'rainy') rainbowAt = absMinutes;
   currentWeather = mode;
   const wv = document.getElementById('weatherBtnValue');
   if (wv) wv.textContent = WEATHER_EMOJI[mode] || '';
@@ -4584,6 +4586,363 @@ function setWeather(mode) {
 function rollDailyWeather() {
   const r = Math.random();
   setWeather(r < 0.1 ? 'rainy' : r < 0.2 ? 'hot' : 'sunny');
+}
+
+// =========================================================
+// Rain effects: puddles, ripples, splashes, wind on plants, rainbow
+// =========================================================
+// Puddles form once it has rained for PUDDLE_DELAY real seconds (not game time),
+// and dry out over PUDDLE_DRY game minutes once the rain stops.
+const PUDDLE_DELAY = 10, PUDDLE_GROW = 12, PUDDLE_DRY = 120;
+const RAINBOW_MINUTES = 30; // game minutes of rainbow once the sun is back
+let rainRealSec = 0;        // real seconds of rain so far in this shower
+let windAmount = 0;         // 0 calm … 1 rainy-day breeze, eased so plants settle gently
+let rainbowAt = -1e9;       // absMinutes when the sky last cleared after rain
+const SWAY = [];            // plant meshes the wind moves: { m, ol, x, y, z, kind, ph }
+
+// ---- Surface heights the rain lands on. Static scenery (roofs, walls, trees,
+// flowers, fences, chargers…) is baked once into a height grid from each mesh's
+// bounding box; cars and people move, so they are tested live every frame.
+const HG = { x0: -100, z0: -85, step: 0.5, nx: 400, nz: 340 };
+let rainHeights = null;
+function rainMovers() {
+  const out = new Set([player]);
+  cars.forEach(c => out.add(c.obj));
+  carScripts.forEach(s => s.entry && out.add(s.entry.obj));
+  STAFF.forEach(st => { out.add(st.obj); if (st.carEntry) out.add(st.carEntry.obj); });
+  visitors.forEach(v => { out.add(v.obj); if (v.carEntry) out.add(v.carEntry.obj); });
+  return out;
+}
+function bakeRainHeights() {
+  const h = new Float32Array(HG.nx * HG.nz);
+  const skip = new Set();
+  rainMovers().forEach(o => o && o.traverse(c => skip.add(c)));
+  const bb = new THREE.Box3();
+  scene.updateMatrixWorld(true);
+  const visit = (o) => {
+    if (!o.visible || skip.has(o) || o.userData.noRain) return;
+    if (o.isMesh && o.geometry) {
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      bb.copy(o.geometry.boundingBox).applyMatrix4(o.matrixWorld);
+      const top = bb.max.y;
+      if (top > 0.08 && top < 25) {
+        const i0 = Math.max(0, Math.floor((bb.min.x - HG.x0) / HG.step));
+        const i1 = Math.min(HG.nx - 1, Math.floor((bb.max.x - HG.x0) / HG.step));
+        const k0 = Math.max(0, Math.floor((bb.min.z - HG.z0) / HG.step));
+        const k1 = Math.min(HG.nz - 1, Math.floor((bb.max.z - HG.z0) / HG.step));
+        for (let k = k0; k <= k1; k++) for (let i = i0; i <= i1; i++) {
+          const n = k * HG.nx + i;
+          if (top > h[n]) h[n] = top;
+        }
+      }
+    }
+    o.children.forEach(visit);
+  };
+  scene.children.forEach(visit);
+  // Covered areas are open-topped so the camera can see in; the rain stops at
+  // their wall tops (the car wash at its clear roof) unless something real is higher.
+  for (const c of COVERED) {
+    const roofY = c.x0 === 48 ? 3.5 : 4;
+    for (let k = 0; k < HG.nz; k++) {
+      const z = HG.z0 + (k + 0.5) * HG.step;
+      if (z <= c.z0 || z >= c.z1) continue;
+      for (let i = 0; i < HG.nx; i++) {
+        const x = HG.x0 + (i + 0.5) * HG.step;
+        if (x <= c.x0 || x >= c.x1) continue;
+        const n = k * HG.nx + i;
+        if (h[n] < 2.5) h[n] = roofY;
+      }
+    }
+  }
+  rainHeights = h;
+}
+function staticRainHeight(x, z) {
+  const i = Math.floor((x - HG.x0) / HG.step), k = Math.floor((z - HG.z0) / HG.step);
+  if (i < 0 || k < 0 || i >= HG.nx || k >= HG.nz) return 0;
+  return rainHeights[k * HG.nx + i];
+}
+// Live tops of cars and people near the player, rebuilt each rainy frame
+// From makeCar (body top 1.65, cabin top 2.47) and CHAR_HEIGHT
+const CAR_BODY_TOP = 1.65, CAR_CABIN_TOP = 2.47, PERSON_TOP = 2.3;
+const rainDyn = [];
+function collectRainDyn() {
+  rainDyn.length = 0;
+  const px = player.position.x, pz = player.position.z;
+  const near = (o) => o && o.visible && o.parent && Math.abs(o.position.x - px) < 42 && Math.abs(o.position.z - pz) < 42;
+  const seen = new Set();
+  const addCarObj = (o) => {
+    if (seen.has(o) || !near(o)) return; seen.add(o);
+    rainDyn.push({ car: true, x: o.position.x, z: o.position.z, c: Math.cos(o.rotation.y), s: Math.sin(o.rotation.y),
+                   y: o.position.y, top: o.position.y + CAR_CABIN_TOP });
+  };
+  const addPerson = (o) => {
+    if (seen.has(o) || !near(o)) return; seen.add(o);
+    rainDyn.push({ car: false, x: o.position.x, z: o.position.z, top: o.position.y + PERSON_TOP });
+  };
+  cars.forEach(c => addCarObj(c.obj));
+  carScripts.forEach(s => s.entry && addCarObj(s.entry.obj));
+  if (playerModelVisible !== false && !driving) addPerson(player);
+  STAFF.forEach(st => { addPerson(st.obj); if (st.carEntry) addCarObj(st.carEntry.obj); });
+  visitors.forEach(v => { addPerson(v.obj); if (v.carEntry) addCarObj(v.carEntry.obj); });
+}
+// Height the rain hits at (x, z): roof, car, head, flower or ground
+function rainSurface(x, z, y) {
+  let top = staticRainHeight(x, z);
+  if (y < 4) {
+    for (const d of rainDyn) {
+      if (d.top <= top) continue;
+      const dx = x - d.x, dz = z - d.z;
+      if (d.car) {
+        // car local frame: length along x, width along z; the cabin sits a bit aft
+        const lx = dx * d.c - dz * d.s, lz = dx * d.s + dz * d.c;
+        if (Math.abs(lz) < 1.0) {
+          if (Math.abs(lx + 0.2) < 1.15 && lz * lz < 0.85) top = d.top;
+          else if (Math.abs(lx) < 2.05 && d.y + CAR_BODY_TOP > top) top = d.y + CAR_BODY_TOP;
+        }
+      } else if (dx * dx + dz * dz < 0.2) top = d.top;
+    }
+  }
+  return top;
+}
+
+// ---- Puddles: irregular flat blobs on the open lot, placed at the first shower
+const puddleWetMat = toon(0x5f676e, { transparent: true, opacity: 0.32, depthWrite: false });
+const puddleWaterMat = toon(0xa9bccb, { transparent: true, opacity: 0.62, depthWrite: false });
+const puddles = [];
+function blobGeo(r, seed) {
+  const pts = [], N = 18;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2;
+    const k = 1 + 0.18 * Math.sin(a * 2 + seed) + 0.1 * Math.sin(a * 3 + seed * 1.7);
+    pts.push(new THREE.Vector2(Math.cos(a) * r * k, Math.sin(a) * r * k));
+  }
+  const g = new THREE.ShapeGeometry(new THREE.Shape(pts));
+  g.rotateX(-Math.PI / 2);
+  return g;
+}
+function placePuddles() {
+  const want = 46;
+  for (let tries = 0; puddles.length < want && tries < 4000; tries++) {
+    const x = WORLD.xMin + 3 + Math.random() * (WORLD.xMax - WORLD.xMin - 6);
+    const z = WORLD.zMin + 3 + Math.random() * (WORLD.zMax - WORLD.zMin - 6);
+    const r = 0.7 + Math.random() * 1.1;
+    if (isCovered(x, z)) continue;
+    // keep clear of anything standing there (walls, flowers, chargers…) and of each other
+    let ok = true;
+    for (let a = 0; a < 8 && ok; a++) {
+      const sx = x + Math.cos(a * 0.785) * r * 1.2, sz = z + Math.sin(a * 0.785) * r * 1.2;
+      if (staticRainHeight(sx, sz) > 0.1 || isCovered(sx, sz)) ok = false;
+    }
+    if (!ok || staticRainHeight(x, z) > 0.1) continue;
+    if (colliders.some(c => !cars.some(e => e.collider === c) &&
+        x > c.minX - r && x < c.maxX + r && z > c.minZ - r && z < c.maxZ + r)) continue;
+    if (puddles.some(p => Math.hypot(p.x - x, p.z - z) < p.r + r + 2)) continue;
+    const seed = Math.random() * 10;
+    const wet = new THREE.Mesh(blobGeo(r * 1.25, seed), puddleWetMat);
+    const water = new THREE.Mesh(blobGeo(r, seed + 0.4), puddleWaterMat);
+    wet.position.set(x, 0.052, z); water.position.set(x, 0.056, z);
+    wet.renderOrder = 1; water.renderOrder = 2;
+    wet.userData.noRain = water.userData.noRain = true;
+    wet.visible = water.visible = false;
+    scene.add(wet, water);
+    puddles.push({ x, z, r, wet, water, lvl: 0, delay: Math.random() * 14 });
+  }
+}
+
+// ---- Ripples: rings that open out and fade where drops land in a puddle
+const rippleGeo = new THREE.RingGeometry(0.86, 1, 28).rotateX(-Math.PI / 2);
+const ripples = [];
+for (let i = 0; i < 70; i++) {
+  const m = new THREE.Mesh(rippleGeo, new THREE.MeshBasicMaterial({ color: 0xe4ecf1, transparent: true, opacity: 0, depthWrite: false }));
+  m.visible = false; m.renderOrder = 3; m.userData.noRain = true;
+  scene.add(m);
+  ripples.push({ m, t: 0, life: 0, size: 0 });
+}
+let rippleNext = 0;
+function spawnRipple(x, z, size) {
+  const r = ripples[rippleNext]; rippleNext = (rippleNext + 1) % ripples.length;
+  r.m.position.set(x, 0.06, z); r.t = 0; r.life = 0.6 + Math.random() * 0.3; r.size = size;
+  r.m.visible = true;
+}
+function puddleAt(x, z) {
+  for (const p of puddles) {
+    if (p.lvl < 0.25) continue;
+    const rr = p.r * p.water.scale.x * 0.85;
+    const dx = x - p.x, dz = z - p.z;
+    if (dx * dx + dz * dz < rr * rr) return p;
+  }
+  return null;
+}
+
+// ---- Splash chips: tiny droplets that bounce off whatever the rain hits
+const SPLASH_MAX = 900;
+const splashPos = new Float32Array(SPLASH_MAX * 3).fill(-100);
+const splashVel = new Float32Array(SPLASH_MAX * 3);
+const splashLife = new Float32Array(SPLASH_MAX);
+const splashGeo = new THREE.BufferGeometry();
+splashGeo.setAttribute('position', new THREE.BufferAttribute(splashPos, 3));
+const splashes = new THREE.Points(splashGeo, new THREE.PointsMaterial({
+  color: 0xcfe0ee, size: 0.07, transparent: true, opacity: 0.85, depthWrite: false
+}));
+splashes.frustumCulled = false; splashes.userData.noRain = true; splashes.visible = false;
+scene.add(splashes);
+let splashNext = 0;
+function spawnSplash(x, y, z) {
+  const n = 2 + (Math.random() < 0.4 ? 1 : 0);
+  for (let j = 0; j < n; j++) {
+    const i = splashNext; splashNext = (splashNext + 1) % SPLASH_MAX;
+    const a = Math.random() * Math.PI * 2, sp = 0.5 + Math.random() * 1.1;
+    splashPos[i * 3] = x; splashPos[i * 3 + 1] = y + 0.02; splashPos[i * 3 + 2] = z;
+    splashVel[i * 3] = Math.cos(a) * sp; splashVel[i * 3 + 1] = 1.6 + Math.random() * 1.6; splashVel[i * 3 + 2] = Math.sin(a) * sp;
+    splashLife[i] = 0.28 + Math.random() * 0.18;
+  }
+}
+
+// ---- Rainbow: a soft pastel arc in the sky once the weather clears after rain
+const rainbowMat = new THREE.ShaderMaterial({
+  uniforms: { uOpacity: { value: 0 }, uInner: { value: 78 }, uOuter: { value: 90 } },
+  transparent: true, depthWrite: false, fog: false, side: THREE.DoubleSide,
+  vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: [
+    'uniform float uOpacity, uInner, uOuter; varying vec3 vP;',
+    'void main(){',
+    '  float t = clamp((length(vP.xy) - uInner) / (uOuter - uInner), 0.0, 1.0);',
+    // muted bands, violet inside → red outside
+    '  vec3 c0 = vec3(0.70,0.63,0.82), c1 = vec3(0.58,0.71,0.85), c2 = vec3(0.66,0.81,0.62);',
+    '  vec3 c3 = vec3(0.91,0.85,0.60), c4 = vec3(0.91,0.71,0.54), c5 = vec3(0.88,0.56,0.56);',
+    '  float s = t * 5.0; vec3 col = mix(c0, c1, clamp(s, 0.0, 1.0));',
+    '  col = mix(col, c2, clamp(s - 1.0, 0.0, 1.0)); col = mix(col, c3, clamp(s - 2.0, 0.0, 1.0));',
+    '  col = mix(col, c4, clamp(s - 3.0, 0.0, 1.0)); col = mix(col, c5, clamp(s - 4.0, 0.0, 1.0));',
+    '  float edge = sin(t * 3.14159);',
+    '  float foot = smoothstep(25.0, 55.0, vP.y);', // the arc's feet melt into the haze
+    '  gl_FragColor = vec4(col, uOpacity * edge * foot * 0.7);',
+    '}'
+  ].join('\n')
+});
+const rainbow = new THREE.Mesh(new THREE.RingGeometry(78, 90, 96, 1, 0, Math.PI), rainbowMat);
+rainbow.visible = false; rainbow.renderOrder = -1; rainbow.userData.noRain = true;
+scene.add(rainbow);
+
+// A new run or a loaded save starts with a dry lot and a clear sky
+function resetRainFx() {
+  rainRealSec = 0; windAmount = 0; rainbowAt = -1e9;
+  puddles.forEach(p => { p.lvl = 0; p.wet.visible = p.water.visible = false; });
+}
+
+function updateRainFx(dt, simDt) {
+  const raining = currentWeather === 'rainy';
+  if (raining && !rainHeights) { bakeRainHeights(); placePuddles(); }
+  rainRealSec = raining ? rainRealSec + dt : 0;
+  windAmount += ((raining ? 1 : 0) - windAmount) * Math.min(1, dt * 0.6);
+  const t = performance.now() / 1000;
+
+  // ----- Drops: fall, land on the first surface below, splash -----
+  if (rain.visible) {
+    collectRainDyn();
+    const pos = rainGeo.attributes.position.array;
+    const px = player.position.x, pz = player.position.z;
+    for (let i = 0; i < RAIN_COUNT; i++) {
+      const y = (pos[i * 3 + 1] -= 22 * dt);
+      const wx = pos[i * 3] + rain.position.x, wz = pos[i * 3 + 2] + rain.position.z;
+      if (y > 9) continue; // nothing in the lot stands taller than the trees
+      const surf = rainSurface(wx, wz, y);
+      if (y < surf) {
+        // Splash chips only where the camera can see them
+        const dx = wx - px, dz = wz - pz;
+        if (dx * dx + dz * dz < 900 && Math.random() < 0.7) spawnSplash(wx, surf, wz);
+        if (surf < 0.1) { const p = puddleAt(wx, wz); if (p) spawnRipple(wx, wz, 0.25 + Math.random() * 0.2); }
+        pos[i * 3] = (Math.random() - 0.5) * RAIN_AREA;
+        pos[i * 3 + 1] = RAIN_TOP;
+        pos[i * 3 + 2] = (Math.random() - 0.5) * RAIN_AREA;
+      }
+    }
+    rainGeo.attributes.position.needsUpdate = true;
+    rain.position.set(player.position.x, 0, player.position.z);
+  }
+
+  // ----- Splash chips: short ballistic hops -----
+  let anySplash = false;
+  for (let i = 0; i < SPLASH_MAX; i++) {
+    if (splashLife[i] <= 0) continue;
+    splashLife[i] -= dt;
+    if (splashLife[i] <= 0) { splashPos[i * 3 + 1] = -100; continue; }
+    anySplash = true;
+    splashVel[i * 3 + 1] -= 14 * dt;
+    splashPos[i * 3] += splashVel[i * 3] * dt;
+    splashPos[i * 3 + 1] += splashVel[i * 3 + 1] * dt;
+    splashPos[i * 3 + 2] += splashVel[i * 3 + 2] * dt;
+  }
+  splashes.visible = anySplash;
+  if (anySplash) splashGeo.attributes.position.needsUpdate = true;
+
+  // ----- Puddles: grow after PUDDLE_DELAY real seconds of rain, dry in the sun -----
+  for (const p of puddles) {
+    if (raining) {
+      if (rainRealSec > PUDDLE_DELAY + p.delay) p.lvl = Math.min(1, p.lvl + dt / PUDDLE_GROW);
+    } else if (p.lvl > 0) p.lvl = Math.max(0, p.lvl - simDt / PUDDLE_DRY);
+    const on = p.lvl > 0.005;
+    p.wet.visible = p.water.visible = on;
+    if (on) {
+      const s = Math.sqrt(p.lvl); // area grows linearly with water, radius with its root
+      p.wet.scale.setScalar(Math.min(1, s * 1.15));
+      p.water.scale.setScalar(Math.max(0.01, s));
+      // a little extra pattering on the puddles closest to the player
+      if (raining && p.lvl > 0.3 && Math.abs(p.x - player.position.x) < 30 && Math.abs(p.z - player.position.z) < 30 &&
+          Math.random() < dt * 4 * p.r * s) {
+        const a = Math.random() * Math.PI * 2, rr = Math.random() * p.r * s * 0.8;
+        spawnRipple(p.x + Math.cos(a) * rr, p.z + Math.sin(a) * rr, 0.2 + Math.random() * 0.25);
+      }
+    }
+  }
+  for (const r of ripples) {
+    if (!r.m.visible) continue;
+    r.t += dt;
+    const k = r.t / r.life;
+    if (k >= 1) { r.m.visible = false; continue; }
+    r.m.scale.setScalar(0.05 + r.size * k);
+    r.m.material.opacity = 0.7 * (1 - k);
+  }
+
+  // ----- Wind: flowers, bushes and trees lean and sway while it rains -----
+  if (windAmount > 0.002) {
+    for (const w of SWAY) {
+      const lean = windAmount * (w.kind === 'tree' ? 0.03 + 0.025 * Math.sin(t * 1.3 + w.ph)
+                                 : w.kind === 'bush' ? 0.06 + 0.05 * Math.sin(t * 2.1 + w.ph)
+                                 : 0.35 + 0.3 * Math.sin(t * 3.4 + w.ph));
+      const side = windAmount * 0.25 * Math.sin(t * 0.9 + w.ph * 1.7) * lean;
+      if (w.kind === 'flower') {
+        // flower heads bob on their (invisible) stems
+        w.m.position.set(w.x + Math.sin(lean) * 0.16, w.y - (1 - Math.cos(lean)) * 0.16, w.z + side * 0.16);
+      } else {
+        // trunks pivot at the ground; the crown rides on top of the trunk's lean
+        w.m.rotation.z = -lean; w.m.rotation.x = side;
+        w.m.position.set(w.x + Math.sin(lean) * w.y, w.y * Math.cos(lean), w.z + Math.sin(side) * w.y);
+      }
+      if (w.ol) { w.ol.position.copy(w.m.position); w.ol.rotation.copy(w.m.rotation); }
+    }
+  } else if (windAmount > 0) {
+    windAmount = 0;
+    for (const w of SWAY) {
+      w.m.position.set(w.x, w.y, w.z); w.m.rotation.set(0, 0, 0);
+      if (w.ol) { w.ol.position.copy(w.m.position); w.ol.rotation.copy(w.m.rotation); }
+    }
+  }
+
+  // ----- Rainbow: fades in when the sky clears, lasts RAINBOW_MINUTES game minutes -----
+  const since = absMinutes - rainbowAt;
+  let rb = 0;
+  if (!raining && since >= 0 && since < RAINBOW_MINUTES) {
+    rb = Math.min(1, since / 2, (RAINBOW_MINUTES - since) / 5) * Math.min(1, daylightFactor(gameMinutes) * 1.5);
+  }
+  rainbow.visible = rb > 0.01;
+  if (rainbow.visible) {
+    // Like a real rainbow it keeps its distance from you; it always sits in the
+    // sky ahead of the camera so the player sees it whichever way they face.
+    const fx = -Math.sin(camYaw), fz = -Math.cos(camYaw);
+    rainbow.position.set(camera.position.x + fx * 200, -98, camera.position.z + fz * 200);
+    rainbow.rotation.set(0, camYaw, 0);
+    rainbowMat.uniforms.uOpacity.value = rb;
+  }
 }
 
 // =========================================================
@@ -5755,6 +6114,17 @@ grassPatch(58.5, 60, -40, 8);    // east (clear of car wash + repaired cars)
 grassPatch(58.5, 60, 16, 41);
 grassPatch(-52, 60, 41, 45);     // south
 
+// Let the wind move a plant mesh (and the outline hull outline() added beside it)
+function swayable(m, kind) {
+  let ol = null;
+  for (let i = scene.children.length - 1; i >= Math.max(0, scene.children.length - 4); i--) {
+    const c = scene.children[i];
+    if (c !== m && c.userData.isOutline && c.geometry === m.geometry) { ol = c; break; }
+  }
+  SWAY.push({ m, ol, x: m.position.x, y: m.position.y, z: m.position.z, kind,
+              ph: (m.position.x * 0.37 + m.position.z * 0.61) % (Math.PI * 2) });
+}
+
 // ---- Flower beds on the grass (press W nearby to smell them — sunny days only)
 const FLOWER_SPOTS = [];
 function flowerBed(x, z) {
@@ -5769,6 +6139,7 @@ function flowerBed(x, z) {
     const f = new THREE.Mesh(new THREE.SphereGeometry(0.15, 8, 6), toon(CAR_COLORS[i % CAR_COLORS.length]));
     f.position.set(x + Math.cos(a) * r, 0.16, z + Math.sin(a) * r);
     scene.add(f);
+    swayable(f, 'flower');
   }
 }
 flowerBed(-30, -42.5); flowerBed(0, -42.5); flowerBed(30, -42.5);
@@ -5782,6 +6153,7 @@ function bush(x, z, sc = 1) {
   b.castShadow = true;
   scene.add(b);
   outline(b, 1.05);
+  swayable(b, 'bush');
 }
 [-43, -40, -29, -24, -16, -12, -8].forEach(x => bush(x, 0.8, 0.9 + (Math.abs(x) % 3) * 0.15));
 [9, 20, 27].forEach(x => bush(x, -4.2, 1.05));
@@ -5793,12 +6165,14 @@ function pine(x, z) {
   trunk.castShadow = true;
   scene.add(trunk);
   outline(trunk);
+  swayable(trunk, 'tree');
   const crown = new THREE.Mesh(new THREE.SphereGeometry(3, 12, 10), toon(0x6f9c68));
   crown.position.set(x, 5.5, z);
   crown.scale.set(1.3, 0.75, 1.3);
   crown.castShadow = true;
   scene.add(crown);
   outline(crown, 1.04);
+  swayable(crown, 'tree');
   box(x - 0.6, x + 0.6, z - 0.6, z + 0.6);
 }
 pine(52, 43);
@@ -8143,21 +8517,8 @@ function animate() {
   camera.position.lerp(camTarget, photoMode ? 0.18 : 0.08);
   camera.lookAt(focus.x, focus.y + 1.5, focus.z);
 
-  // ----- Rain -----
-  if (rain.visible) {
-    const pos = rainGeo.attributes.position.array;
-    for (let i = 0; i < RAIN_COUNT; i++) {
-      pos[i * 3 + 1] -= 22 * dt;
-      const wx = pos[i * 3] + rain.position.x, wz = pos[i * 3 + 2] + rain.position.z;
-      if (pos[i * 3 + 1] < 0 || (pos[i * 3 + 1] < 4.4 && isCovered(wx, wz))) {
-        pos[i * 3] = (Math.random() - 0.5) * RAIN_AREA;
-        pos[i * 3 + 1] = RAIN_TOP;
-        pos[i * 3 + 2] = (Math.random() - 0.5) * RAIN_AREA;
-      }
-    }
-    rainGeo.attributes.position.needsUpdate = true;
-    rain.position.set(player.position.x, 0, player.position.z);
-  }
+  // ----- Rain: drops, splashes, puddles, wind, rainbow -----
+  updateRainFx(dt, simDt);
 
   // Clouds drift slowly east and wrap around
   for (const c of clouds) {
@@ -8519,6 +8880,7 @@ function applySnapshot(snap) {
   snap.objectives.forEach(o => OBJECTIVES.push(o));
   refreshQuestNpcs(); renderObjectives();
   setWeather(snap.weather);
+  resetRainFx();
   // re-arm the purchase pipeline if the save sits mid-chain
   const restock = OBJECTIVES.find(o => o.id === 'restock-first-car');
   if (restock && !restock.done) nextPurchaseAt = absMinutes + 120;
@@ -8695,6 +9057,7 @@ function resetRunState() {
   OBJECTIVES.push({ ...STAGE0_FIRST });
   refreshQuestNpcs(); renderObjectives();
   setWeather('sunny');
+  resetRainFx();
 }
 function startNewGame(characterName) {
   const saves = store.saves(currentUser.email);
